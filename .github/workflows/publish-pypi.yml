@@ -9,7 +9,6 @@ jobs:
   publish:
     name: publish
     runs-on: ubuntu-latest
-    environment: publish
     permissions:
       contents: read
       id-token: write # PyPI trusted publishing
