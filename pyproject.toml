@@ -1,6 +1,6 @@
 [project]
 name = "sentdm-voice-agents"
-version = "0.0.0" # x-release-please-version
+version = "0.1.0" # x-release-please-version
 description = "Sent Voice Agents for Python: an AI agent that takes and places phone calls through Sent"
 readme = "README.md"
 license = "Apache-2.0"
