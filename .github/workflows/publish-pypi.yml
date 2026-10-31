@@ -1,0 +1,23 @@
+# Runs when release-please publishes a release, and by hand to publish again if a run failed.
+name: Publish PyPI
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+      - name: Build
+        run: uv build
+      - name: Publish
+        run: uv publish --trusted-publishing always
