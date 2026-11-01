@@ -244,6 +244,10 @@ class UnknownFrame:
     session_id: str | None
     data: dict[str, Any]
 
+    @property
+    def TYPE(self) -> str:  # noqa: N802 - the wire type, as the known frames spell it
+        return self.type
+
 
 Frame = Union[ConnectionReady, ConnectionDraining, Ping, ErrorFrame, SessionStart, UserSaid, ToolResult, SessionEnd, SessionResumed, AgentSay, ToolCall, AgentClear, SessionResume, Pong, UnknownFrame]
 
@@ -259,7 +263,7 @@ SESSION_SCOPED = frozenset({"session.start", "user.said", "tool.result", "sessio
 SESSION_TYPES: dict[str, frozenset[str]] = {"session.start": frozenset({"text", "audio"}), "user.said": frozenset({"text"}), "tool.result": frozenset({"text", "audio"}), "session.end": frozenset({"text", "audio"}), "session.resumed": frozenset({"text", "audio"}), "agent.say": frozenset({"text"}), "tool.call": frozenset({"text", "audio"}), "agent.clear": frozenset({"text", "audio"}), "session.resume": frozenset({"text", "audio"})}
 # Session frames that count towards `received` on each side; every other frame with a session_id,
 # also one of an unknown type, counts too. The ones not counted are listed so a runtime can tell.
-UNCOUNTED = frozenset({"session.start", "session.resumed", "session.resume", "audio"})
+UNCOUNTED = frozenset({"error", "session.start", "session.resumed", "session.resume", "audio"})
 
 # The values Sent lists today; it may add more, so a runtime treats others as it would the fallback.
 PARTY_KINDS = ("user", "number", "conference", "agent", "anonymous",)
