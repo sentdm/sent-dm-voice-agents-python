@@ -27,7 +27,8 @@ log = logging.getLogger("sentdm_voice_agents")
 DEFAULT_URL = f"wss://{frames.HOST}{frames.CONNECT_PATH}"
 # The longest wait before another attempt to connect.
 MAX_BACKOFF_S = 30.0
-# How long a handshake may take before the attempt counts as failed.
+# How long a handshake may take before the attempt counts as failed, and how long an open socket may wait for
+# connection.ready before it counts as dead.
 HANDSHAKE_TIMEOUT_S = 10.0
 # How many heartbeat intervals without a frame make a connection dead, as Heartbeats in docs/protocol.md says.
 SILENT_INTERVALS = 3
@@ -89,6 +90,8 @@ class Agent:
         self._connections: set[_Connection] = set()
         self._sessions: dict[str, Session] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        # Connection-level handlers run off the reader, so a slow one never delays a ping's pong or a session.
+        self._background: set[asyncio.Task[None]] = set()
         self._attempt = 0
         self._stopped = False
         self._done: asyncio.Future[None] | None = None
@@ -174,9 +177,9 @@ class Agent:
                 connection.task.cancel()
             if connection.task is not None:
                 tasks.append(connection.task)
-        for task in self._tasks.values():
+        for task in [*self._tasks.values(), *self._background]:
             task.cancel()
-        await asyncio.gather(*tasks, *self._tasks.values(), return_exceptions=True)
+        await asyncio.gather(*tasks, *self._tasks.values(), *self._background, return_exceptions=True)
 
     # ----- connections -----
 
@@ -215,11 +218,12 @@ class Agent:
 
     async def _read(self, connection: _Connection, socket: ClientConnection) -> None:
         while True:
-            timeout = SILENT_INTERVALS * connection.heartbeat_s if connection.ready else None
+            # Before connection.ready the socket has the handshake's deadline; after it, the heartbeat's.
+            timeout = SILENT_INTERVALS * connection.heartbeat_s if connection.ready else HANDSHAKE_TIMEOUT_S
             try:
                 message = await asyncio.wait_for(socket.recv(), timeout)
             except TimeoutError:
-                log.warning("no frame for %.0f s, closing", timeout or 0)
+                log.warning("no %s for %.0f s, closing", "frame" if connection.ready else "connection.ready", timeout)
                 return
             except ConnectionClosed as closed:
                 close = closed.rcvd or closed.sent
@@ -240,6 +244,10 @@ class Agent:
             await self._ready(connection, frame)
         elif isinstance(frame, frames.Ping):
             await connection.send(frames.Pong(ts=frame.ts))
+            # A connection that lived through a heartbeat interval is a good one: the next loss starts the
+            # backoff over. A connection that dies before its first ping keeps it growing.
+            if connection.ready:
+                self._attempt = 0
         elif isinstance(frame, frames.ConnectionDraining):
             self._drain(connection)
         elif isinstance(frame, frames.SessionStart):
@@ -248,7 +256,7 @@ class Agent:
             await self._resumed(connection, frame)
         elif isinstance(frame, frames.ErrorFrame):
             self._error(connection, frame)
-            await self._safely(self.on_error(frame))
+            self._spawn(self.on_error(frame))
         elif isinstance(frame, frames.UnknownFrame) and frame.session_id is None:
             log.info("ignored a %s frame", frame.type)
         else:
@@ -257,13 +265,12 @@ class Agent:
     async def _ready(self, connection: _Connection, frame: frames.ConnectionReady) -> None:
         connection.ready = True
         connection.heartbeat_s = frame.heartbeat_interval_ms / 1000
-        self._attempt = 0
         pending = [s for s in connection.pending if self._sessions.get(s.id) is s]
         connection.pending = []
         log.info("ready: protocol %s, up to %s sessions, resuming %s", frame.protocol_version, frame.max_sessions, len(pending))
         for session in pending:
             await self._resume(connection, session)
-        await self._safely(self.on_connected(frame))
+        self._spawn(self.on_connected(frame))
 
     async def _resume(self, connection: _Connection, session: Session) -> None:
         for other in self._connections:
@@ -319,9 +326,13 @@ class Agent:
             await connection.send(frame_again)
 
     def _error(self, connection: _Connection, frame: frames.ErrorFrame) -> None:
+        """An error is uncounted, as Counting frames in docs/protocol.md says. Only one that refuses a
+        session.resume changes the session's fate; any other is the handler's to read."""
         log.warning("error %s: %s", frame.error.code, frame.error.message)
         session = connection.sessions.get(frame.session_id or "")
         if session is None or not session._resuming:
+            return
+        if frame.frame_type != "session.resume" and frame.error.code not in ("resume_failed", "connection_full"):
             return
         session._resuming = False
         connection.sessions.pop(session.id, None)
@@ -338,6 +349,7 @@ class Agent:
 
     def _lost(self, session: Session) -> None:
         self._forget(session)
+        session._abandon()
         session._inbox.put_nowait(None)
 
     async def _closed(self, connection: _Connection) -> None:
@@ -390,6 +402,12 @@ class Agent:
             elif isinstance(item, frames.UnknownFrame):
                 await self._safely(self.on_frame(session, item))
         self._tasks.pop(session.id, None)
+
+    def _spawn(self, handler: object) -> None:
+        """Runs a connection-level handler on its own task, off the reader."""
+        task = asyncio.create_task(self._safely(handler))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     async def _safely(self, handler: object) -> None:
         """Runs a handler; an exception in it is logged and does not take the session or the agent down."""
