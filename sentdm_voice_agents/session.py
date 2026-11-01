@@ -50,6 +50,8 @@ class Session:
         self.received = 0
         # session.end, once it arrived.
         self.end: frames.SessionEnd | None = None
+        # The connection was lost and the session could not be resumed: Sent ends the call without a session.end.
+        self.lost = False
         self._connection = connection
         # A session.resume was sent on the current connection and Sent has not answered it yet.
         self._resuming = False
@@ -64,7 +66,8 @@ class Session:
 
     @property
     def ended(self) -> bool:
-        return self.end is not None
+        """Whether the call has left the agent: session.end arrived, or the session was lost."""
+        return self.end is not None or self.lost
 
     @property
     def resumable(self) -> bool:
@@ -87,9 +90,15 @@ class Session:
 
     async def send_audio(self, samples: bytes) -> None:
         """Audio sessions: play `samples`, 16-bit little-endian mono PCM at the session's sample rate. Send
-        20 ms per call, and no more than 200 ms."""
+        20 ms per call, and no more than 200 ms. Raises SessionEnded once the call has left the agent."""
+        if self.ended:
+            raise SessionEnded(self.id)
         if self.stream is None:
             raise RuntimeError(f"session {self.id} is a text session")
+        if self._resuming:
+            # The stream number belongs to the old connection; on the new one it may be another caller's until
+            # session.resumed assigns this session's. Audio is not counted, so there is nothing to send again.
+            return
         await self._connection.send_bytes(audio_frame(self.stream, samples))
 
     async def transfer(self, to: frames.Party | str) -> frames.ToolResult:
@@ -125,10 +134,15 @@ class Session:
 
     async def _send(self, frame: frames.Frame) -> None:
         """Sends a frame for the session on its connection, keeping it if it counts. A frame that could not be
-        sent still counts: Sent's `received` on the next resume says whether to send it again."""
+        sent still counts: Sent's `received` on the next resume says whether to send it again. A frame that
+        breaks the protocol is refused before it counts. While a resume is unanswered the frame is kept and not
+        sent: the replay after session.resumed sends it, once, on the connection the session is on."""
         if self.ended:
             raise SessionEnded(self.id)
+        frames.encode(frame)
         self._keep(frame)
+        if self._resuming:
+            return
         await self._connection.send(frame)
 
     def _keep(self, frame: frames.Frame) -> None:
@@ -180,6 +194,16 @@ class Session:
 
     def _finish(self, end: frames.SessionEnd) -> None:
         self.end = end
+        self._fail_pending()
+
+    def _abandon(self) -> None:
+        """The session is lost: no tool.result or session.end will come, so every waiting tool call fails, and
+        anything sent from now on is refused."""
+        self.lost = True
+        self._resuming = False
+        self._fail_pending()
+
+    def _fail_pending(self) -> None:
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(SessionEnded(self.id))
