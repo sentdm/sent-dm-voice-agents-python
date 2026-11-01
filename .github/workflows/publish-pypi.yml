@@ -1,9 +1,26 @@
-# Runs when release-please publishes a release, and by hand to publish again if a run failed.
+# Runs when release-please publishes a release, and by hand to publish again if a run failed. By hand with
+# `dry_run`, it only exchanges the job's OIDC token with PyPI, which checks the trusted publisher without
+# publishing. A hand publish runs on the release tag, never on a branch: `gh workflow run publish-pypi.yml
+# --ref v<version>`.
+#
+# PyPI is pushed by trusted publishing: the job's OIDC token is exchanged for a short-lived upload token against
+# the publisher registered on PyPI (repository sentdm/sent-dm-voice-agents-python, workflow publish-pypi.yml,
+# environment blank). No long-lived key exists anywhere.
 name: Publish PyPI
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Exchange the OIDC token with PyPI and stop, to check the trusted publisher without publishing
+        type: boolean
+        default: false
   release:
     types: [published]
+
+concurrency:
+  # A dry run never queues behind, or displaces, a real publish.
+  group: publish-pypi${{ inputs.dry_run && '-dry-run' || '' }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -11,13 +28,50 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # PyPI trusted publishing
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: The version to publish
+        # 0.0.0 is the template's placeholder: the repository has no release yet. A hand run publishes the
+        # release tag whose version pyproject.toml carries, so main's later commits never ship under an old number.
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' pyproject.toml | head -1)"
+          echo "version=$version"
+          [ "$DRY_RUN" = "true" ] && exit 0
+          if [ "$version" = "0.0.0" ]; then
+            echo "no release yet: pyproject.toml still carries 0.0.0" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && { [ "$GITHUB_REF_TYPE" != "tag" ] || [ "$GITHUB_REF_NAME" != "v$version" ]; }; then
+            echo "a hand run publishes the release tag: gh workflow run publish-pypi.yml --ref v$version" >&2
+            exit 1
+          fi
+      - name: Check the trusted publisher
+        # The exchange PyPI makes on upload: the job's OIDC token for a short-lived upload token. A 2xx means the
+        # publisher on PyPI names this repository and workflow. The token is never printed.
+        if: ${{ inputs.dry_run }}
+        run: |
+          id_token="$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=pypi" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("value", ""))')"
+          if [ -z "$id_token" ]; then
+            echo "GitHub issued no OIDC token for this job" >&2
+            exit 1
+          fi
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d "{\"token\": \"$id_token\"}" https://pypi.org/_/oidc/mint-token)"
+          case "$code" in
+            2*) echo "PyPI exchanged the token (HTTP $code): the trusted publisher matches this repository and workflow" ;;
+            *)
+              echo "PyPI refused the exchange with HTTP $code: no trusted publisher matches this repository and workflow" >&2
+              exit 1 ;;
+          esac
       - uses: astral-sh/setup-uv@v6
+        if: ${{ !inputs.dry_run }}
       - name: Build
+        if: ${{ !inputs.dry_run }}
         run: uv build
       - name: Publish
+        if: ${{ !inputs.dry_run }}
         run: uv publish --trusted-publishing always
