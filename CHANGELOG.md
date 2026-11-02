@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/sentdm/sent-dm-voice-agents-python/compare/v0.1.1...v0.2.0) (2026-11-02)
+
+
+### Features
+
+* **protocol:** protocol v1.0.0 ([4520f7b](https://github.com/sentdm/sent-dm-voice-agents-python/commit/4520f7b10857c3b036641b8c1abb1eb1af002ddf))
+
 ## [0.1.1](https://github.com/sentdm/sent-dm-voice-agents-python/compare/v0.1.0...v0.1.1) (2026-11-01)
 
 
